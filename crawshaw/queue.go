@@ -6,11 +6,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"github.com/caasmo/restinpieces/db"
-	"github.com/caasmo/restinpieces/queue"
 	"time"
 )
 
-func (d *Db) InsertJob(job queue.Job) error {
+func (d *Db) InsertJob(job db.Job) error {
 
 	conn := d.pool.Get(nil)
 	defer d.pool.Put(conn)
@@ -79,11 +78,11 @@ func (d *Db) MarkFailed(jobID int64, errMsg string) error {
 	return nil
 }
 
-func (d *Db) Claim(limit int) ([]*queue.Job, error) {
+func (d *Db) Claim(limit int) ([]*db.Job, error) {
 	conn := d.pool.Get(nil)
 	defer d.pool.Put(conn)
 
-	var jobs []*queue.Job
+	var jobs []*db.Job
 	err := sqlitex.Exec(conn,
 		`UPDATE job_queue
 		SET status = 'processing',
@@ -133,7 +132,7 @@ func (d *Db) Claim(limit int) ([]*queue.Job, error) {
 				}
 			}
 
-			job := &queue.Job{
+			job := &db.Job{
 				ID:           stmt.GetInt64("id"),
 				JobType:      stmt.GetText("job_type"),
 				Payload:      json.RawMessage(stmt.GetText("payload")),
