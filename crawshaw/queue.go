@@ -10,30 +10,34 @@ import (
 )
 
 func (d *Db) InsertJob(job db.Job) error {
-
 	conn := d.pool.Get(nil)
 	defer d.pool.Put(conn)
 
+	var scheduledForStr string
+	if !job.ScheduledFor.IsZero() {
+		scheduledForStr = db.TimeFormat(job.ScheduledFor)
+	}
+
 	err := sqlitex.Exec(conn, `INSERT INTO job_queue
-		(job_type, payload, payload_extra, attempts, max_attempts)
-		VALUES (?, ?, ?, ?, ?)`,
-		nil,                      // No results needed for INSERT
-		job.JobType,              // 1. job_type
-		string(job.Payload),      // 2. payload
-		string(job.PayloadExtra), // 3. payload_extra
-		job.Attempts,             // 4. attempts
-		job.MaxAttempts,          // 5. max_attempts
+		(job_type, payload, payload_extra, attempts, max_attempts, recurrent, interval, scheduled_for)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+		nil,
+		job.JobType,
+		string(job.Payload),
+		string(job.PayloadExtra),
+		job.Attempts,
+		job.MaxAttempts,
+		job.Recurrent,
+		job.Interval.String(),
+		scheduledForStr,
 	)
 
 	if err != nil {
-		// Removed specific unique constraint check
 		return fmt.Errorf("queue insert failed: %w", err)
 	}
 	return nil
 }
 
-// Claim locks and returns up to limit jobs for processing
-// The jobs are marked as 'processing' and locked by the current worker
 func (d *Db) MarkCompleted(jobID int64) error {
 	conn := d.pool.Get(nil)
 	defer d.pool.Put(conn)
@@ -83,8 +87,7 @@ func (d *Db) Claim(limit int) ([]*db.Job, error) {
 	defer d.pool.Put(conn)
 
 	var jobs []*db.Job
-	err := sqlitex.Exec(conn,
-		`UPDATE job_queue
+	sql := `UPDATE job_queue
 		SET status = 'processing',
 			locked_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now'),
 			attempts = attempts + 1
@@ -92,11 +95,14 @@ func (d *Db) Claim(limit int) ([]*db.Job, error) {
 			SELECT id
 			FROM job_queue
 			WHERE status IN ('pending', 'failed')
+			  AND scheduled_for <= strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
 			ORDER BY id ASC
 			LIMIT ?
 		)
 		RETURNING id, job_type, payload, payload_extra, status, attempts, max_attempts, created_at, updated_at,
-			scheduled_for, locked_by, locked_at, completed_at, last_error`,
+			scheduled_for, locked_by, locked_at, completed_at, last_error, recurrent, interval`
+
+	err := sqlitex.Exec(conn, sql,
 		func(stmt *sqlite.Stmt) error {
 			createdAt, err := db.TimeParse(stmt.GetText("created_at"))
 			if err != nil {
@@ -132,6 +138,14 @@ func (d *Db) Claim(limit int) ([]*db.Job, error) {
 				}
 			}
 
+			var interval time.Duration
+			if intervalStr := stmt.GetText("interval"); intervalStr != "" {
+				interval, err = time.ParseDuration(intervalStr)
+				if err != nil {
+					return fmt.Errorf("error parsing interval duration '%s': %w", intervalStr, err)
+				}
+			}
+
 			job := &db.Job{
 				ID:           stmt.GetInt64("id"),
 				JobType:      stmt.GetText("job_type"),
@@ -147,6 +161,8 @@ func (d *Db) Claim(limit int) ([]*db.Job, error) {
 				LockedAt:     lockedAt,
 				CompletedAt:  completedAt,
 				LastError:    stmt.GetText("last_error"),
+				Recurrent:    stmt.GetInt64("recurrent") != 0,
+				Interval:     interval,
 			}
 			jobs = append(jobs, job)
 			return nil
@@ -155,5 +171,67 @@ func (d *Db) Claim(limit int) ([]*db.Job, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to claim jobs: %w", err)
 	}
+	if jobs == nil {
+		jobs = []*db.Job{}
+	}
 	return jobs, nil
+}
+
+func (d *Db) MarkRecurrentCompleted(completedJobID int64, newJob db.Job) error {
+	conn := d.pool.Get(nil)
+	if conn == nil {
+		return fmt.Errorf("failed to get connection for mark recurrent completed: connection is nil")
+	}
+	defer d.pool.Put(conn)
+
+	err := sqlitex.Exec(conn, "BEGIN IMMEDIATE;", nil)
+	if err != nil {
+		return fmt.Errorf("failed to begin transaction for mark recurrent completed: %w", err)
+	}
+
+	err = sqlitex.Exec(conn,
+		`UPDATE job_queue
+		SET status = 'completed',
+			completed_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now'),
+			updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now'),
+			locked_at = '',
+			last_error = ''
+		WHERE id = ?`,
+		nil,
+		completedJobID,
+	)
+	if err != nil {
+		_ = sqlitex.Exec(conn, "ROLLBACK;", nil)
+		return fmt.Errorf("failed to mark job %d completed in transaction: %w", completedJobID, err)
+	}
+
+	var scheduledForStr string
+	if !newJob.ScheduledFor.IsZero() {
+		scheduledForStr = db.TimeFormat(newJob.ScheduledFor)
+	}
+
+	err = sqlitex.Exec(conn, `INSERT INTO job_queue
+		(job_type, payload, payload_extra, attempts, max_attempts, recurrent, interval, scheduled_for)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+		nil,
+		newJob.JobType,
+		string(newJob.Payload),
+		string(newJob.PayloadExtra),
+		newJob.Attempts,
+		newJob.MaxAttempts,
+		newJob.Recurrent,
+		newJob.Interval.String(),
+		scheduledForStr,
+	)
+	if err != nil {
+		_ = sqlitex.Exec(conn, "ROLLBACK;", nil)
+		return fmt.Errorf("failed to re-insert job in transaction: %w", err)
+	}
+
+	err = sqlitex.Exec(conn, "COMMIT;", nil)
+	if err != nil {
+		return fmt.Errorf("failed to commit transaction for mark recurrent completed: %w", err)
+	}
+
+	return nil
 }
